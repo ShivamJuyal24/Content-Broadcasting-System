@@ -1,0 +1,337 @@
+================================================================
+CONTENT BROADCASTING SYSTEM — ARCHITECTURE NOTES
+================================================================
+
+----------------------------------------------------------------
+1. AUTHENTICATION & RBAC FLOW
+----------------------------------------------------------------
+
+JWT-based stateless authentication is used across all protected routes.
+
+Registration & Login:
+- POST /auth/register → accepts name, email, password, role (teacher/principal)
+- Password is hashed using bcrypt (saltRounds: 10) before storing
+- POST /auth/login → verifies credentials, returns a signed JWT
+
+JWT Payload:
+  { id, email, role }
+  Signed with JWT_SECRET, expires in 7d
+
+Middleware Chain:
+  authenticate(req, res, next)
+    → reads Authorization: Bearer <token>
+    → verifies and decodes JWT
+    → attaches decoded payload to req.user
+    → calls next() or returns 401
+
+  authorize(...roles)
+    → checks req.user.role against allowed roles
+    → returns 403 if role not permitted
+    → calls next() if allowed
+
+RBAC Matrix:
+  Route                        | Teacher | Principal
+  -----------------------------|---------|----------
+  POST /content/upload         |   ✅    |    ❌
+  GET  /content/my             |   ✅    |    ❌
+  GET  /approval/pending       |   ❌    |    ✅
+  GET  /approval/all           |   ❌    |    ✅
+  POST /approval/:id/approve   |   ❌    |    ✅
+  POST /approval/:id/reject    |   ❌    |    ✅
+  GET  /content/live/:id       |  public | public
+
+Design Decision:
+  Roles are stored in the users table. No separate roles/permissions
+  table is needed at this scale. The authorize() middleware is composable
+  and can accept multiple roles if needed in future.
+
+----------------------------------------------------------------
+2. SUBJECT-BASED SYSTEM DESIGN
+----------------------------------------------------------------
+
+Each teacher × subject pair maps to exactly one content_slot row.
+This is enforced via a UNIQUE(subject, teacher_id) constraint.
+
+Why this design?
+  - Subjects are not globally unique — two teachers can both teach Maths
+  - The slot acts as a "channel" per teacher per subject
+  - All content for that channel shares a single rotation sequence
+
+Subject values are stored as lowercase strings (e.g., "maths", "science").
+No enum constraint is applied so new subjects can be added without
+schema changes.
+
+Subject filtering on the public API:
+  GET /content/live/:teacherId?subject=maths
+  → filters active content to only the specified subject slot
+
+If no subject filter is provided, all active content across all of
+that teacher's subjects is returned (one active item per subject slot).
+
+----------------------------------------------------------------
+3. UPLOAD HANDLING APPROACH
+----------------------------------------------------------------
+
+Library: Multer (multipart/form-data middleware for Express)
+
+Configuration (src/utils/storage.js):
+  - diskStorage used with destination: /uploads/
+  - Filename: Date.now() + original extension (avoids collisions)
+  - fileFilter: allows only image/jpeg, image/png, image/gif
+  - limits: { fileSize: 10 * 1024 * 1024 } (10MB hard limit)
+
+Stored fields in DB (content table):
+  - file_url: relative path e.g. uploads/1714300000000.jpg
+  - file_type: MIME type from multer
+  - file_size: size in bytes
+
+Path normalization:
+  Windows dev environments produce backslash paths from multer.
+  All paths are normalized with .replace(/\\/g, '/') before DB insert.
+
+On upload:
+  - File saved to disk first (multer handles this)
+  - DB record inserted with status: 'pending'
+  - Teacher receives the content record in response
+
+Supported formats: JPG, PNG, GIF
+Max file size: 10MB
+
+Bonus (not implemented): S3 upload via aws-sdk using multer-s3,
+  swapping diskStorage for s3Storage. File URL would then be the
+  S3 object URL. Architecture supports this swap without controller
+  changes.
+
+----------------------------------------------------------------
+4. APPROVAL WORKFLOW DESIGN
+----------------------------------------------------------------
+
+Content Lifecycle:
+  uploaded → pending → approved
+                    → rejected (with rejection_reason)
+
+Only the Principal role can call approval routes.
+
+Approve flow (POST /approval/:id/approve):
+  1. Fetch content by id, confirm status is 'pending'
+  2. Update status → 'approved', set approved_by = req.user.id,
+     approved_at = NOW()
+  3. Auto-trigger scheduling:
+     a. getOrCreateSlot(subject, teacherId) → finds or creates slot row
+     b. addToSchedule(contentId, slotId, duration) → inserts into
+        content_schedule with next rotation_order
+
+Reject flow (POST /approval/:id/reject):
+  1. Requires rejection_reason in request body (validated)
+  2. Updates status → 'rejected', stores rejection_reason
+  3. No slot/schedule entries are created
+
+Teacher visibility:
+  GET /content/my → returns all content uploaded by the teacher,
+  including status and rejection_reason, so teachers can see why
+  content was rejected.
+
+Design Decision:
+  Scheduling is triggered automatically on approval rather than
+  being a separate manual step. This reduces teacher burden and
+  ensures no approved content is accidentally left unscheduled.
+
+  Duration defaults to 5 minutes if not provided at upload time.
+
+----------------------------------------------------------------
+5. SCHEDULING / ROTATION LOGIC (CORE LOGIC)
+----------------------------------------------------------------
+
+The scheduling system determines which piece of content is
+"currently live" for a given teacher + subject at any moment in time.
+
+Data Model:
+  content_schedule:
+    content_id     → FK to content
+    slot_id        → FK to content_slots (teacher + subject)
+    rotation_order → integer, determines sequence (1, 2, 3 ...)
+    duration       → how many minutes this content occupies
+
+Algorithm (getActiveContent in src/services/scheduling.service.js):
+
+  Step 1 — Fetch eligible content
+    SELECT content joined with content_schedule and content_slots
+    WHERE slot.teacher_id = :teacherId
+      AND content.status = 'approved'
+      AND content.start_time <= NOW()
+      AND content.end_time   >= NOW()
+    ORDER BY slot_id, rotation_order
+
+  Step 2 — Group by slot (subject)
+    { slotId → [{ contentId, duration, rotation_order, subject }, ...] }
+
+  Step 3 — For each slot, find the active content
+    a. Calculate total cycle = sum of all durations in the slot (minutes)
+    b. anchor = earliest start_time among all content in the slot
+       (acts as the "zero point" of the rotation clock)
+    c. elapsed = (NOW - anchor) in minutes
+    d. position = elapsed % totalCycle  ← where we are in the loop
+    e. Walk through items in rotation_order, accumulating duration,
+       until the accumulated duration exceeds position
+    f. That item is the currently active content
+
+  Step 4 — Return one active item per slot
+    If subject filter is provided, return only that slot's result.
+
+Example:
+  Slot: Maths, Teacher A
+  Content A: duration 5 min, rotation_order 1
+  Content B: duration 5 min, rotation_order 2
+  Content C: duration 5 min, rotation_order 3
+  Total cycle = 15 min
+
+  anchor = start_time of earliest content (e.g., 09:00)
+  At 09:07 → elapsed = 7 min → position = 7 % 15 = 7
+    → A covers 0–5, B covers 5–10 → B is active ✅
+
+Edge Cases Handled:
+  - No approved content → returns []
+  - Content outside time window → excluded in SQL WHERE clause
+  - start_time or end_time missing → content not shown (required fields
+    for scheduling; without them content is never active)
+  - Only one content in slot → always shown (100% of cycle)
+  - Content rotated off → next in sequence shown automatically
+
+----------------------------------------------------------------
+6. DATABASE DESIGN DECISIONS
+----------------------------------------------------------------
+
+Primary Keys: UUID (gen_random_uuid()) on all tables
+  - Prevents enumeration attacks on public endpoints like /content/live/:id
+  - Safe to expose teacher IDs in URLs
+
+users
+  - role stored as VARCHAR with a CHECK constraint (teacher/principal)
+  - email has UNIQUE constraint + index for fast login lookup
+
+content
+  - uploaded_by → FK to users (teacher)
+  - approved_by → FK to users (nullable, principal who approved)
+  - start_time, end_time → TIMESTAMPTZ for timezone-aware scheduling
+  - status uses CHECK constraint: uploaded/pending/approved/rejected
+  - rejection_reason is nullable (only set on rejection)
+
+content_slots
+  - UNIQUE(subject, teacher_id) → one slot per teacher per subject
+  - Acts as a join/grouping entity for the rotation
+
+content_schedule
+  - rotation_order is an integer assigned sequentially per slot
+  - duration stored in minutes (INTEGER)
+  - No FK cascade delete implemented (content should be archived,
+    not hard-deleted, in production)
+
+Indexes:
+  - users.email
+  - content.uploaded_by
+  - content.status
+  - content_slots(subject, teacher_id)
+  - content_schedule.slot_id
+
+----------------------------------------------------------------
+7. FOLDER STRUCTURE
+----------------------------------------------------------------
+
+root/
+  server.js              ← HTTP server, port binding
+  uploads/               ← local file storage (gitignored in prod)
+  .env                   ← secrets (not committed)
+  src/
+    app.js               ← Express app, global middleware, route mounting
+    models/
+      db.js              ← Neon PostgreSQL pool (pg library)
+    controllers/
+      auth.controller.js       ← register, login
+      content.controller.js    ← upload, getMyContent
+      approval.controller.js   ← pending, all, approve, reject
+      broadcast.controller.js  ← live content public endpoint
+    routes/
+      auth.routes.js
+      content.routes.js
+      approval.routes.js
+      broadcast.routes.js
+    middlewares/
+      auth.middleware.js  ← authenticate, authorize factory
+    services/
+      scheduling.service.js  ← getOrCreateSlot, addToSchedule,
+                                getActiveContent
+    utils/
+      storage.js          ← multer disk storage config
+
+Design Principle:
+  Controllers handle HTTP (req/res). Services contain business logic.
+  Controllers call services; services call the DB directly via db.js.
+  This separation makes services independently testable.
+
+----------------------------------------------------------------
+8. MIDDLEWARE USAGE
+----------------------------------------------------------------
+
+Global (app.js):
+  - express.json()            → parse JSON request bodies
+  - express.urlencoded()      → parse form fields (needed with multer)
+  - express.static('uploads') → serve uploaded files publicly
+
+Per-route:
+  - authenticate              → validate JWT, attach req.user
+  - authorize('teacher')      → restrict to teacher role
+  - authorize('principal')    → restrict to principal role
+  - upload.single('file')     → multer file handling (content upload)
+
+Error handling:
+  Multer errors (file type, size) are caught in the controller and
+  returned as 400 responses with descriptive messages.
+  All async controllers are wrapped with try/catch returning 500 on
+  unexpected errors.
+
+----------------------------------------------------------------
+9. SCALABILITY APPROACH
+----------------------------------------------------------------
+
+Current (MVP):
+  - Stateless JWT → horizontally scalable (no session store needed)
+  - Neon DB (serverless Postgres) → connection pooling built-in
+  - Local file storage → single-server only
+
+Near-term improvements:
+
+  Caching (Redis):
+    - Cache GET /content/live/:teacherId responses with TTL equal to
+      the shortest active content duration in the rotation
+    - Cache invalidated on approval or schedule change
+    - Reduces DB hits significantly for popular teacher endpoints
+
+  Rate Limiting:
+    - Apply express-rate-limit on /content/live/* (public endpoint)
+    - Prevents abuse/scraping without auth overhead
+    - Suggested: 60 requests/minute per IP
+
+  File Storage (S3):
+    - Swap multer diskStorage for multer-s3
+    - File URLs become S3 object URLs
+    - Enables CDN distribution (CloudFront) for file serving
+    - No controller changes needed (storage abstracted in utils/storage.js)
+
+  Queue-based Approval Notifications:
+    - On approval, push a job to a queue (BullMQ + Redis)
+    - Worker sends email/push notification to teacher
+    - Decouples notification from the HTTP request cycle
+
+  Database:
+    - Add read replicas for /content/live queries (read-heavy)
+    - Partition content table by status for faster approved queries
+    - Archive old/expired content to a separate table
+
+  Monitoring:
+    - Structured logging (Winston/Pino) with request IDs
+    - Health check endpoint GET /health
+    - APM integration (Datadog/New Relic) for production
+
+================================================================
+END OF ARCHITECTURE NOTES
+================================================================

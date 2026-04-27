@@ -14,6 +14,7 @@ A backend system that allows teachers to upload content (question papers, announ
 | Auth | JWT + bcrypt |
 | File Upload | Multer (local disk storage) |
 | ORM/Query | pg (node-postgres) |
+| Rate Limiting | express-rate-limit |
 
 ---
 
@@ -234,11 +235,55 @@ GET /approval/pending
 Authorization: Bearer <token>
 ```
 
-#### View All Content
+---
+
+#### View All Content (with Filters & Pagination)
 ```
 GET /approval/all
 Authorization: Bearer <token>
 ```
+
+**Query Parameters (all optional):**
+
+| Param | Type | Description | Example |
+|---|---|---|---|
+| `status` | string | Filter by content status | `approved`, `pending`, `rejected` |
+| `subject` | string | Filter by subject | `maths`, `science` |
+| `teacher` | string | Filter by teacher name (partial match) | `john` |
+| `page` | number | Page number (default: 1) | `2` |
+| `limit` | number | Results per page (default: 10) | `5` |
+
+**Examples:**
+```
+GET /approval/all?status=approved
+GET /approval/all?subject=maths&page=2&limit=5
+GET /approval/all?teacher=john&status=pending
+GET /approval/all?status=approved&subject=science&page=1&limit=10
+```
+
+**Response:**
+```json
+{
+  "content": [
+    {
+      "id": "...",
+      "title": "Chapter 3 Questions",
+      "subject": "maths",
+      "status": "approved",
+      "teacher_name": "John Doe",
+      ...
+    }
+  ],
+  "pagination": {
+    "total": 42,
+    "page": 1,
+    "limit": 10,
+    "totalPages": 5
+  }
+}
+```
+
+---
 
 #### Approve Content
 ```
@@ -250,6 +295,8 @@ Authorization: Bearer <token>
 ```json
 { "message": "Content approved and scheduled successfully" }
 ```
+
+---
 
 #### Reject Content
 ```
@@ -271,6 +318,9 @@ Content-Type: application/json
 
 ### Public Broadcasting API (No Auth Required)
 
+> **Rate Limited:** 60 requests per minute per IP.
+> Exceeding the limit returns `429 Too Many Requests`.
+
 #### Get Live Content for a Teacher
 ```
 GET /content/live/:teacherId
@@ -280,8 +330,7 @@ GET /content/live/:teacherId?subject=maths
 **Response — content is live:**
 ```json
 {
-  "teacherId": "...",
-  "activeContent": [
+  "active_content": [
     {
       "id": "...",
       "title": "Chapter 3 — Algebra",
@@ -289,7 +338,9 @@ GET /content/live/:teacherId?subject=maths
       "file_url": "uploads/1714300000000.jpg",
       "description": "Practice questions",
       "rotation_order": 2,
-      "duration": 5
+      "duration": 5,
+      "start_time": "2026-04-28T09:00:00Z",
+      "end_time": "2026-04-28T17:00:00Z"
     }
   ]
 }
@@ -298,6 +349,11 @@ GET /content/live/:teacherId?subject=maths
 **Response — nothing live:**
 ```json
 { "message": "No content available" }
+```
+
+**Response — rate limit exceeded:**
+```json
+{ "message": "Too many requests, please try again later." }
 ```
 
 ---
@@ -319,7 +375,7 @@ Content B → 5 min (rotation_order: 2)
 Content C → 5 min (rotation_order: 3)
 Total cycle: 15 min
 
-At t=7min → B is active
+At t=7min  → B is active
 At t=12min → C is active
 At t=17min → A is active again (looped)
 ```
@@ -341,6 +397,7 @@ Content is only shown if:
 | Invalid subject filter | Returns `{ message: "No content available" }` |
 | File type not allowed | Returns 400 with error message |
 | File size > 10MB | Returns 400 with error message |
+| Rate limit exceeded on public API | Returns 429 with error message |
 
 ---
 
@@ -351,13 +408,14 @@ root/
   server.js                 ← starts HTTP server
   uploads/                  ← local file storage
   src/
-    app.js                  ← Express app setup, route mounting
+    app.js                  ← Express app setup, route mounting,
+                               rate limiter on /content/live
     models/
       db.js                 ← Neon PostgreSQL connection pool
     controllers/
       auth.controller.js
       content.controller.js
-      approval.controller.js
+      approval.controller.js   ← includes filters + pagination
       broadcast.controller.js
     routes/
       auth.routes.js
@@ -384,15 +442,20 @@ root/
 4. The `rotation_order` for a new content item is assigned as `MAX(rotation_order) + 1` within its slot at the time of approval.
 5. The teacher's UUID is used directly in the public URL (`/content/live/:teacherId`). This is safe because UUIDs are non-enumerable.
 
-### Skipped / Bonus Features (not implemented)
+### Bonus Features Implemented
+
+| Feature | Details |
+|---|---|
+| Rate Limiting | `express-rate-limit` on `GET /content/live/*` — 60 req/min/IP |
+| Pagination & Filters | `GET /approval/all` supports `?status`, `?subject`, `?teacher`, `?page`, `?limit` |
+
+### Skipped Bonus Features
 
 | Feature | Reason |
 |---|---|
 | S3 file storage | Local disk storage used as per base requirement |
 | Redis caching | Not implemented; architecture notes describe the approach |
-| Rate limiting | Not implemented; can be added with `express-rate-limit` |
 | Subject-wise analytics | Out of scope for base submission |
-| Pagination & filters | Not implemented in this version |
 
 ---
 

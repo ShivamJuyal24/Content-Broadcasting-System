@@ -243,12 +243,14 @@ root/
   .env                   ← secrets (not committed)
   src/
     app.js               ← Express app, global middleware, route mounting
+                           rate limiter applied here on /content/live
     models/
       db.js              ← Neon PostgreSQL pool (pg library)
     controllers/
       auth.controller.js       ← register, login
       content.controller.js    ← upload, getMyContent
-      approval.controller.js   ← pending, all, approve, reject
+      approval.controller.js   ← pending, all (filters + pagination),
+                                  approve, reject
       broadcast.controller.js  ← live content public endpoint
     routes/
       auth.routes.js
@@ -282,21 +284,33 @@ Per-route:
   - authorize('teacher')      → restrict to teacher role
   - authorize('principal')    → restrict to principal role
   - upload.single('file')     → multer file handling (content upload)
+  - rateLimiter               → applied to /content/live/* in app.js
+                                60 requests/minute per IP
+                                returns 429 with descriptive message on breach
 
 Error handling:
   Multer errors (file type, size) are caught in the controller and
   returned as 400 responses with descriptive messages.
   All async controllers are wrapped with try/catch returning 500 on
   unexpected errors.
+  Rate limit breaches return 429 Too Many Requests.
 
 ----------------------------------------------------------------
 9. SCALABILITY APPROACH
 ----------------------------------------------------------------
 
-Current (MVP):
+Implemented:
   - Stateless JWT → horizontally scalable (no session store needed)
   - Neon DB (serverless Postgres) → connection pooling built-in
-  - Local file storage → single-server only
+  - Rate Limiting (express-rate-limit) → applied on /content/live/*
+    60 requests/minute per IP, protects the only unauthenticated
+    endpoint from abuse/scraping with zero DB overhead
+  - Pagination & Filters on GET /approval/all:
+    → ?status, ?subject, ?teacher query params build a dynamic WHERE clause
+    → ?page and ?limit control result window (default: page=1, limit=10)
+    → A separate COUNT query returns total for pagination metadata
+    → Keeps response payloads bounded regardless of data volume
+    → Parameters are passed as positional $N values (no SQL injection risk)
 
 Near-term improvements:
 
@@ -305,11 +319,6 @@ Near-term improvements:
       the shortest active content duration in the rotation
     - Cache invalidated on approval or schedule change
     - Reduces DB hits significantly for popular teacher endpoints
-
-  Rate Limiting:
-    - Apply express-rate-limit on /content/live/* (public endpoint)
-    - Prevents abuse/scraping without auth overhead
-    - Suggested: 60 requests/minute per IP
 
   File Storage (S3):
     - Swap multer diskStorage for multer-s3

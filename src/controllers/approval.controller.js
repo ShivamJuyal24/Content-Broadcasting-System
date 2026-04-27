@@ -1,6 +1,6 @@
 const db = require('../models/db.js');
 const { getOrCreateSlot, addToSchedule } = require('../services/scheduling.service');
-// GET all pending content — principal only
+
 const getPendingContent = async (req, res) => {
   try {
     const result = await db.query(
@@ -16,25 +16,67 @@ const getPendingContent = async (req, res) => {
   }
 };
 
-// GET all content (any status) — principal overview
+// GET all content — with optional filters + pagination
 const getAllContent = async (req, res) => {
   try {
+    const { status, teacher, subject, page = 1, limit = 10 } = req.query;
+
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    const conditions = [];
+    const values = [];
+
+    if (status) {
+      values.push(status);
+      conditions.push(`c.status = $${values.length}`);
+    }
+    if (subject) {
+      values.push(subject.toLowerCase());
+      conditions.push(`c.subject = $${values.length}`);
+    }
+    if (teacher) {
+      values.push(`%${teacher}%`);
+      conditions.push(`u.name ILIKE $${values.length}`);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    // Get total count for pagination meta
+    const countResult = await db.query(
+      `SELECT COUNT(*) FROM content c JOIN users u ON c.uploaded_by = u.id ${where}`,
+      values
+    );
+    const total = parseInt(countResult.rows[0].count);
+
+    // Paginated query
+    values.push(parseInt(limit));
+    values.push(offset);
     const result = await db.query(
       `SELECT c.*, u.name as teacher_name
        FROM content c
        JOIN users u ON c.uploaded_by = u.id
-       ORDER BY c.created_at DESC`
+       ${where}
+       ORDER BY c.created_at DESC
+       LIMIT $${values.length - 1} OFFSET $${values.length}`,
+      values
     );
-    res.json({ content: result.rows });
+
+    res.json({
+      content: result.rows,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(total / parseInt(limit))
+      }
+    });
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 };
 
-// POST approve content
 const approveContent = async (req, res) => {
   const { id } = req.params;
-  const { duration } = req.body; // optional, defaults to 5 mins
+  const { duration } = req.body;
 
   try {
     const check = await db.query('SELECT * FROM content WHERE id = $1', [id]);
@@ -47,7 +89,6 @@ const approveContent = async (req, res) => {
 
     const content = check.rows[0];
 
-    // 1. Update status to approved
     const result = await db.query(
       `UPDATE content 
        SET status = 'approved', approved_by = $1, approved_at = NOW()
@@ -56,10 +97,7 @@ const approveContent = async (req, res) => {
       [req.user.id, id]
     );
 
-    // 2. Find or create slot for this subject+teacher
     const slot = await getOrCreateSlot(content.subject, content.uploaded_by);
-
-    // 3. Add to schedule with rotation order
     await addToSchedule(content.id, slot.id, duration || 5);
 
     res.json({ message: 'Content approved and scheduled', content: result.rows[0] });
@@ -67,7 +105,7 @@ const approveContent = async (req, res) => {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 };
-// POST reject content
+
 const rejectContent = async (req, res) => {
   const { id } = req.params;
   const { rejection_reason } = req.body;
